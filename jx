@@ -1,0 +1,676 @@
+#!/usr/bin/env bash
+# jx - a compact wrapper for the most useful journalctl commands
+# Copyright (C) 2026 Marcel Hartmann
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -euo pipefail
+
+VERSION="0.2"
+
+die() { echo "jx: $*" >&2; exit 1; }
+
+# Temporary files are removed on exit, also on Ctrl-C.
+TMPFILES=() ERRF=""
+cleanup() { [[ ${#TMPFILES[@]} -eq 0 ]] || rm -f -- "${TMPFILES[@]}"; }
+trap cleanup EXIT
+
+# ---------------------------------------------------------------- settings
+
+STYLE=${JX_STYLE:-columns}   # columns | compact | raw
+NOPAGER=${JX_NOPAGER:-0}
+ASSUME_YES=0
+
+# Global flags may appear anywhere; everything else is kept in order.
+args=()
+for a in "$@"; do
+  case $a in
+    --raw)      STYLE=raw ;;
+    --compact)  STYLE=compact ;;
+    --no-pager) NOPAGER=1 ;;
+    -y|--yes)   ASSUME_YES=1 ;;
+    *)          args+=("$a") ;;
+  esac
+done
+set -- "${args[@]}"
+
+case $STYLE in
+  columns|compact|raw) ;;
+  *) die "unknown style '$STYLE' (JX_STYLE must be columns, compact or raw)" ;;
+esac
+
+COLOR=0
+[[ -t 1 && -z ${NO_COLOR:-} ]] && COLOR=1
+BOLD="" RED="" RST=""
+if [[ $COLOR == 1 ]]; then BOLD=$'\e[1m' RED=$'\e[1;31m' RST=$'\e[0m'; fi
+
+# Reading needs root unless the user is in a journal-reading group.
+# Changing the journal (vacuum, rotate) always needs root.
+SUDO_READ=() SUDO_ROOT=()
+in_log_group() {
+  local g groups
+  read -ra groups <<< "$(id -nG)"
+  for g in "${groups[@]}"; do
+    [[ $g == systemd-journal || $g == adm || $g == wheel ]] && return 0
+  done
+  return 1
+}
+if [[ $EUID -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+  SUDO_ROOT=(sudo)
+  in_log_group || SUDO_READ=(sudo)
+fi
+
+# Ask for the sudo password up front so the prompt doesn't fight the pager.
+sudo_warm() { [[ ${#SUDO_READ[@]} -eq 0 ]] || sudo -v; }
+
+confirm() {
+  [[ $ASSUME_YES == 1 ]] && return 0
+  [[ -t 0 ]] || die "$1 Not a terminal; pass --yes to confirm."
+  local reply
+  read -r -p "$1 [y/N] " reply
+  [[ $reply =~ ^[Yy]([Ee][Ss])?$ ]]
+}
+
+# ---------------------------------------------------------------- output
+
+FIELDS=PRIORITY,SYSLOG_IDENTIFIER,_COMM,_SYSTEMD_UNIT,MESSAGE
+HL="" HL_FLAGS=""   # regex to highlight in the columns view (grep, ssh)
+
+# jq program for the columns view: time, level, source, message;
+# a separator line whenever the day or the boot changes.
+# It prints nothing when there are no entries, so jq -e exits 4 (see finish).
+JQ_COLUMNS='
+def c($code): if $color == "1" and $code != "" then "\u001b[" + $code + "m" else "" end;
+# journalctl -o json gives a field as an array of bytes when it is not printable
+# UTF-8 (escape sequences, control characters, invalid UTF-8). utf8 decodes the
+# bytes as UTF-8 (via base64), clean drops escape sequences and shows other
+# control characters as ^X, so a log entry cannot control the terminal.
+def utf8:
+  ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" | explode) as $abc
+  | . as $b
+  | [range(0; $b | length; 3) as $i
+     | $b[$i:$i+3] as $g
+     | (($g[0] // 0) * 65536 + ($g[1] // 0) * 256 + ($g[2] // 0)) as $n
+     | ([$n / 262144, $n / 4096, $n / 64, $n] | map(floor % 64 | $abc[.]))[0:($g | length) + 1]
+       + [61, 61][0:3 - ($g | length)]]
+  | add // [] | implode | @base64d;
+def clean:
+  gsub("\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)?"; "")
+  | gsub("(?<c>[\\x00-\\x08\\x0b-\\x1f\\x7f\\x{80}-\\x{9f}])";
+         .c | explode | .[0]
+         | if . < 32 then "^" + ([. + 64] | implode) elif . == 127 then "^?" else "�" end);
+def val: if type == "array" then
+           (if length > 0 and (.[0] | type) == "number" then utf8 | clean else map(val) | join(" ") end)
+         elif . == null then "" else tostring end;
+def prio: (try (.PRIORITY | val | tonumber) catch 6) | if . < 0 or . > 7 then 6 else . end;
+def lvl: ["EMERG","ALERT","CRIT","ERR","WARN","NOTE","INFO","DEBUG"][.];
+def lcol: if . <= 3 then "1;31" elif . == 4 then "33" elif . == 5 then "1" elif . == 7 then "2" else "" end;
+def fit($n): if length <= $n then . + (" " * ($n - length)) else .[0:$n-1] + "…" end;
+def shorten($n): if length <= $n then . elif test("\\.") then (split(".")[1:] | join(".") | shorten($n)) else . end;
+def src: (.SYSLOG_IDENTIFIER // ._COMM // ._SYSTEMD_UNIT // "?") | val | shorten(20);
+def hilite:
+  if $hl == "" or $color != "1" then .
+  else . as $s | try (if ("" | test($hl; $hlflags)) then $s
+                      else gsub("(?<m>" + $hl + ")"; c("1;31") + .m + c("0"); $hlflags) end)
+                 catch $s end;
+def header($text): c("1") + "── " + $text + " " + ("─" * ([56 - ($text | length), 3] | max)) + c("0");
+
+foreach inputs as $e (
+  {n: 0, day: null, boot: null};
+  ($e.__REALTIME_TIMESTAMP | tonumber / 1000000 | floor) as $t
+  | ($t | strflocaltime("%a %d %b %Y")) as $d
+  | ($e._BOOT_ID // "") as $b
+  | (.boot != null and $b != .boot) as $newboot
+  | ($e | prio) as $p
+  | ($e | .MESSAGE // "" | val | split("\n")) as $lines
+  | .out = (if .n == 0 or $newboot or $d != .day
+            then (if .n == 0 then "" else "\n" end)
+                 + header($d + (if $newboot then " · boot " + $b[0:8] else "" end)) + "\n"
+            else "" end)
+      + ($t | strflocaltime("%H:%M:%S")) + "  "
+      + c($p | lcol) + ($p | lvl | fit(5)) + c("0") + "  "
+      + c("36") + ($e | src | fit(20)) + c("0") + " "
+      + ($lines[0] // "" | hilite)
+      + ($lines[1:] | map("\n" + (" " * 38) + hilite) | join(""))
+  | .day = $d | .boot = $b | .n += 1;
+  .out
+)
+'
+
+page() {   # $1 = 1 to start at the end
+  if [[ -n ${JX_PAGER:-} ]]; then sh -c "$JX_PAGER"; return; fi
+  command -v less >/dev/null 2>&1 || { cat; return; }
+  local opts=(-FRXMK)
+  [[ ${1:-0} == 1 ]] && opts+=(+G)
+  less "${opts[@]}"
+}
+
+# Run a block of output through one pager (used by failed, crash).
+paged() {
+  if [[ $NOPAGER == 1 || ! -t 1 ]]; then "$@"; return; fi
+  sudo_warm
+  local rc=0
+  { NOPAGER=1; "$@"; } | page 0 || rc=$?
+  [[ $rc == 0 || $rc == 141 ]] || return "$rc"
+}
+
+# jc [journalctl args...] - read the journal in the selected style
+jc() {
+  local style=$STYLE follow=0 end=0 a
+  for a in "$@"; do
+    case $a in
+      -o|-o?*|--output|--output=*|-x|--catalog) style=raw ;;   # explicit format wins
+      -f|--follow)     follow=1 ;;
+      -e|--pager-end)  end=1 ;;
+    esac
+  done
+  if [[ $style == columns ]] && ! command -v jq >/dev/null 2>&1; then style=compact; fi
+
+  if [[ $style != columns ]]; then
+    local extra=() envc=()
+    [[ $style == compact ]] && extra+=(--no-hostname)
+    [[ $NOPAGER == 1 ]] && extra+=(--no-pager)
+    # keep colors when jx itself pipes the output into a pager (failed, crash)
+    [[ $COLOR == 1 ]] && envc=(env SYSTEMD_COLORS=1)
+    "${SUDO_READ[@]}" "${envc[@]}" journalctl "${extra[@]}" "$@"
+    return
+  fi
+
+  # -a: without it journalctl -o json leaves out messages longer than 4 KiB
+  local jargs=(-q -a -o json --output-fields="$FIELDS" "$@")
+  local jqargs=(-n -r -e --arg color "$COLOR" --arg hl "$HL" --arg hlflags "$HL_FLAGS")
+  local st=()
+  : > "$ERRF"
+  if [[ $follow == 1 ]]; then   # live: errors are shown right away
+    { "${SUDO_READ[@]}" journalctl "${jargs[@]}" \
+        | jq "${jqargs[@]}" --unbuffered "$JQ_COLUMNS"
+      st=("${PIPESTATUS[@]}"); } || true
+  elif [[ $NOPAGER == 1 || ! -t 1 ]]; then
+    { "${SUDO_READ[@]}" journalctl "${jargs[@]}" 2>"$ERRF" \
+        | jq "${jqargs[@]}" "$JQ_COLUMNS"
+      st=("${PIPESTATUS[@]}"); } || true
+  else
+    sudo_warm
+    { "${SUDO_READ[@]}" journalctl "${jargs[@]}" 2>"$ERRF" \
+        | jq "${jqargs[@]}" "$JQ_COLUMNS" | page "$end"
+      st=("${PIPESTATUS[@]}"); } || true
+  fi
+  finish "$follow" "${st[@]}"
+}
+
+# finish QUIET JOURNALCTL_RC FORMATTER_RC [PAGER_RC]
+# Ends a "journalctl | formatter [| pager]" pipeline whose journalctl wrote its
+# errors to $ERRF: shows them, prints "-- No entries --" only when the query
+# worked but matched nothing (the formatter exits 4 when it printed nothing),
+# and returns the first real failure. 141 means the pager was closed early.
+finish() {
+  local quiet=$1 failed=0 s
+  shift
+  if [[ -s $ERRF ]]; then cat -- "$ERRF" >&2; failed=1; fi
+  if [[ ${2:-0} == 4 ]]; then
+    set -- "$1" 0 "${@:3}"
+    [[ $quiet == 1 || $failed == 1 ]] || echo "-- No entries --"
+  fi
+  for s in "$@"; do
+    [[ $s == 0 || $s == 141 ]] || return "$s"
+  done
+}
+
+# ---------------------------------------------------------------- boot selector
+
+# N may be an offset (0, -1, +1, ...), a boot ID (optionally with an offset),
+# or "all".
+BOOT=0 BSEL=() REST=()
+is_boot() { [[ ${1:-} =~ ^([+-]?[0-9]+|all|[0-9a-fA-F]{32}([+-][0-9]+)?)$ ]]; }
+
+# Does journalctl read the argument after option $1 as that option's value?
+takes_value() {
+  [[ $1 =~ ^-[A-Za-z]*[bnMDiSUcutTpgoF]$ ||
+     $1 =~ ^--(boot|lines|machine|directory|file|root|image|image-policy|namespace|since|until|cursor|after-cursor|cursor-file|invocation|unit|user-unit|identifier|exclude-identifier|priority|facility|grep|output|output-fields|field)$ ]]
+}
+
+# take_boot ARGS... - move the boot selector N out of ARGS into BOOT and leave
+# the other arguments in REST. N is normally the first argument, but a negative
+# offset is also found further on (jx err -q -1), as journalctl would reject it
+# as an unknown option; it is left alone as the value of an option (-b -1).
+take_boot() {
+  local a prev="" found=""
+  REST=()
+  if is_boot "${1:-}"; then BOOT=$1 found=$1; shift; fi
+  for a in "$@"; do
+    if [[ $a =~ ^-[0-9]+$ ]] && ! takes_value "$prev"; then
+      [[ -z $found ]] || die "boot given twice ($found and $a)"
+      BOOT=$a found=$a
+    else
+      REST+=("$a")
+    fi
+    prev=$a
+  done
+}
+set_boot() { if [[ $BOOT == all ]]; then BSEL=(); else BSEL=(-b "$BOOT"); fi; }
+
+# ---------------------------------------------------------------- help
+
+usage() {
+  cat <<EOF
+jx $VERSION - journalctl made easy
+
+Usage: jx [--raw|--compact] [--no-pager] [--yes] <command> [arguments] [journalctl options]
+
+N selects a boot: 0 = current (default), -1 = previous, ..., +1 = first recorded,
+a boot ID, or "all". It goes right after the command (a negative N also later).
+Any extra options are passed to journalctl, e.g. jx err -1 -u nginx
+
+Viewing
+  boot [N]               Logs of boot N
+  boots                  List recorded boots
+  err [N]                Priority err and higher in boot N
+  warn [N]               Priority warning and higher in boot N
+  kernel [N]             Kernel messages (dmesg replacement) in boot N
+  tail [n]               Last n lines (default 50)
+  follow [unit]          Follow live, optionally a single unit
+
+Filtering
+  unit <name> [since]    Logs of a unit, optionally from a time ("1h ago", "today")
+  since <from> [until]   Time range, e.g. jx since "2026-11-20 08:00" "10:00"
+  last <duration>        Recent entries, e.g. jx last 30min / 2h / 1d
+  grep <pattern> [N]     Case-insensitive regex search in boot N
+  pid <pid> [N]          Logs of a process in boot N
+  exe <name|path> [N]    Logs of a binary in boot N, e.g. jx exe sshd
+  user                   Logs of your user units
+  ssh                    SSH logins and failures today
+
+Diagnosis
+  failed                 Failed units with their last 20 lines
+  crash [N]              How boot N ended (default -1): shutdown or crash,
+                         last errors, last lines, coredumps
+  top [N]                Which sources log the most in boot N
+
+Maintenance
+  disk                   Disk space used by the journal
+  vacuum <size|age>      Delete old archived files, e.g. 500M, 2G, 2weeks, 6months
+  verify                 Check journal file consistency
+  rotate                 Rotate journal files now
+
+Export
+  json <unit> [n]        Last n entries of a unit as JSON (default 20)
+  export <file> [N]      Write boot N to a text file
+
+Other
+  completion bash|zsh    Print a shell completion script
+  help | version
+
+Flags
+  --raw                  Plain journalctl output (also: JX_STYLE=raw)
+  --compact              journalctl output without hostname (JX_STYLE=compact)
+  --no-pager             No pager (also: JX_NOPAGER=1)
+  -y, --yes              Don't ask for confirmation (vacuum, export)
+EOF
+}
+
+# ---------------------------------------------------------------- completion
+
+completion_bash() {
+  cat <<'EOF'
+# bash completion for jx - load with:  source <(jx completion bash)
+_jx_units() {
+  local u
+  u=$(journalctl -F _SYSTEMD_UNIT 2>/dev/null)
+  [[ -n $u ]] || u=$(systemctl list-units --all --plain --no-legend 2>/dev/null | awk '{print $1}')
+  sed 's/\.service$//' <<< "$u"
+}
+_jx_boots() {
+  local b
+  b=$(journalctl --list-boots --no-pager -q 2>/dev/null | awk '$1 ~ /^-?[0-9]+$/ {print $1}' | sort -rn | head -n 10)
+  echo "${b:-0 -1 -2} all"
+}
+_jx() {
+  local cur=${COMP_WORDS[COMP_CWORD]} i=1
+  while (( i < COMP_CWORD )) && [[ ${COMP_WORDS[i]} == -* ]]; do ((i++)); done
+  if (( COMP_CWORD == i )); then
+    COMPREPLY=($(compgen -W "boot boots err warn kernel tail follow unit since last grep pid exe user ssh
+      failed crash top disk vacuum verify rotate json export completion help version
+      --raw --compact --no-pager --yes" -- "$cur"))
+    return
+  fi
+  local cmd=${COMP_WORDS[i]} pos=$(( COMP_CWORD - i ))
+  case $cmd in
+    unit|follow|json)             (( pos == 1 )) && COMPREPLY=($(compgen -W "$(_jx_units)" -- "$cur")) ;;
+    boot|err|warn|kernel|crash|top) (( pos == 1 )) && COMPREPLY=($(compgen -W "$(_jx_boots)" -- "$cur")) ;;
+    grep|pid|export)              (( pos == 2 )) && COMPREPLY=($(compgen -W "$(_jx_boots)" -- "$cur")) ;;
+    exe) if (( pos == 1 )) && [[ $cur != */* ]]; then COMPREPLY=($(compgen -c -- "$cur"))
+         elif (( pos == 2 )); then COMPREPLY=($(compgen -W "$(_jx_boots)" -- "$cur")); fi ;;
+    vacuum)                       (( pos == 1 )) && COMPREPLY=($(compgen -W "500M 1G 2G 2weeks 1months 6months" -- "$cur")) ;;
+    completion)                   (( pos == 1 )) && COMPREPLY=($(compgen -W "bash zsh" -- "$cur")) ;;
+  esac
+  return 0
+}
+complete -o default -F _jx jx
+EOF
+}
+
+completion_zsh() {
+  cat <<'EOF'
+#compdef jx
+# zsh completion for jx - load with:  source <(jx completion zsh)
+# or save it as _jx in a directory on your $fpath.
+_jx_units() {
+  local -a units
+  units=(${(f)"$(journalctl -F _SYSTEMD_UNIT 2>/dev/null)"})
+  (( ${#units} )) || units=(${(f)"$(systemctl list-units --all --plain --no-legend 2>/dev/null | awk '{print $1}')"})
+  units=(${units%.service})
+  compadd -a units
+}
+_jx_boots() {
+  local -a boots
+  boots=(${(f)"$(journalctl --list-boots --no-pager -q 2>/dev/null | awk '$1 ~ /^-?[0-9]+$/ {print $1}' | sort -rn | head -n 10)"})
+  (( ${#boots} )) || boots=(0 -1 -2)
+  compadd -V boots -a boots
+  compadd -- all
+}
+_jx() {
+  local -a cmds
+  cmds=(
+    'boot:logs of boot N'
+    'boots:list recorded boots'
+    'err:errors of boot N'
+    'warn:warnings and worse of boot N'
+    'kernel:kernel messages of boot N'
+    'tail:last n lines'
+    'follow:follow live, optionally one unit'
+    'unit:logs of a unit'
+    'since:time range'
+    'last:recent entries, e.g. 30min'
+    'grep:regex search'
+    'pid:logs of a process'
+    'exe:logs of a binary'
+    'user:logs of your user units'
+    'ssh:SSH logins and failures today'
+    'failed:failed units with their last lines'
+    'crash:how a boot ended, plus coredumps'
+    'top:sources that log the most'
+    'disk:journal disk usage'
+    'vacuum:delete old archived journal files'
+    'verify:check journal files'
+    'rotate:rotate journal files now'
+    'json:last entries of a unit as JSON'
+    'export:write boot N to a file'
+    'completion:print a shell completion script'
+    'help:show help'
+    'version:show version'
+  )
+  local i=2
+  while (( i < CURRENT )) && [[ $words[i] == -* ]]; do (( i++ )); done
+  if (( CURRENT == i )); then
+    if [[ $PREFIX == -* ]]; then compadd -- --raw --compact --no-pager --yes
+    else _describe -t commands 'jx command' cmds; fi
+    return
+  fi
+  local cmd=$words[i] pos=$(( CURRENT - i ))
+  case $cmd in
+    unit|follow|json)               (( pos == 1 )) && _jx_units ;;
+    boot|err|warn|kernel|crash|top) (( pos == 1 )) && _jx_boots ;;
+    grep|pid)                       (( pos == 2 )) && _jx_boots ;;
+    exe)    if (( pos == 1 )); then _alternative 'commands:command:_command_names -e' 'files:file:_files'
+            elif (( pos == 2 )); then _jx_boots; fi ;;
+    export) if (( pos == 1 )); then _files; elif (( pos == 2 )); then _jx_boots; fi ;;
+    vacuum)     (( pos == 1 )) && compadd -- 500M 1G 2G 2weeks 1months 6months ;;
+    completion) (( pos == 1 )) && compadd -- bash zsh ;;
+  esac
+}
+if [[ ${zsh_eval_context[-1]:-} == loadautofunc ]]; then
+  _jx "$@"
+else
+  compdef _jx jx
+fi
+EOF
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_failed() {
+  local units=() uunits=() u
+  mapfile -t units  < <(systemctl list-units --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+  mapfile -t uunits < <(systemctl --user list-units --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+  if [[ ${#units[@]} -eq 0 && ${#uunits[@]} -eq 0 ]]; then
+    echo "No failed units."
+    return
+  fi
+  for u in "${units[@]}"; do
+    printf '\n%s=== %s ===%s\n' "$RED" "$u" "$RST"
+    jc -u "$u" -n 20 "$@"
+  done
+  for u in "${uunits[@]}"; do
+    printf '\n%s=== %s (user) ===%s\n' "$RED" "$u" "$RST"
+    ( SUDO_READ=(); jc --user -u "$u" -n 20 "$@" )
+  done
+}
+
+cmd_crash() {
+  local line="" id idx first last target current
+  # journalctl resolves N (offsets, +N, boot IDs in either case, ID+N);
+  # the boot list then gives its index and time range.
+  id=$("${SUDO_READ[@]}" journalctl -b "$BOOT" -q -n 1 -o export --output-fields=_BOOT_ID 2>/dev/null \
+         | sed -n 's/^_BOOT_ID=//p' || true)
+  if [[ -n $id ]]; then
+    line=$("${SUDO_READ[@]}" journalctl --list-boots --no-pager -q 2>/dev/null \
+             | awk -v id="$id" '$2 == id' || true)
+  fi
+  [[ -n $line ]] || die "boot $BOOT not found. Is the journal persistent? (see README, 'Persistent journal')"
+  read -r idx _ <<< "$line"
+  first=$(awk '{print $3, $4, $5, $6}' <<< "$line")
+  last=$(awk '{print $7, $8, $9, $10}' <<< "$line")
+
+  target=$("${SUDO_READ[@]}" journalctl -b "$id" -q -n 1 -o cat --output-fields=UNIT \
+             MESSAGE_ID=39f53479d3a045ac8e11786248231fbf \
+             UNIT=poweroff.target UNIT=reboot.target UNIT=halt.target \
+             UNIT=kexec.target UNIT=soft-reboot.target 2>/dev/null || true)
+
+  printf '%sBoot %s%s  %s\n' "$BOLD" "$idx" "$RST" "$id"
+  printf '  from   %s\n  to     %s\n' "$first" "$last"
+  current=$(tr -d - 2>/dev/null < /proc/sys/kernel/random/boot_id || true)
+  if [[ $id == "$current" ]]; then
+    printf '  ended  still running (this is the current boot)\n'
+  elif [[ -n $target ]]; then
+    printf '  ended  clean shutdown (%s)\n' "$target"
+  else
+    printf '  ended  %sno clean shutdown recorded: crash, freeze, power loss or hard reset%s\n' "$RED" "$RST"
+  fi
+
+  printf '\n%s── Last errors of that boot ──%s\n' "$BOLD" "$RST"
+  jc -b "$id" -p err -n 15 "$@"
+  printf '\n%s── Last lines of that boot ──%s\n' "$BOLD" "$RST"
+  jc -b "$id" -n 25 "$@"
+  printf '\n%s── Coredumps during that boot ──%s\n' "$BOLD" "$RST"
+  if command -v coredumpctl >/dev/null 2>&1; then
+    "${SUDO_READ[@]}" coredumpctl list --no-pager "_BOOT_ID=$id" 2>/dev/null || echo "None."
+  else
+    echo "coredumpctl not installed."
+  fi
+}
+
+cmd_top() {
+  local limit=${JX_TOP:-20} st=()
+  [[ $limit =~ ^[1-9][0-9]*$ ]] || die "JX_TOP must be a positive number, not '$limit'"
+  : > "$ERRF"
+  { "${SUDO_READ[@]}" journalctl "${BSEL[@]}" -q -o export \
+      --output-fields=SYSLOG_IDENTIFIER,_COMM,PRIORITY "$@" 2>"$ERRF" \
+    | awk -v limit="$limit" '
+        function flush(  k) {
+          if (!seen) return
+          k = (id != "") ? id : ((comm != "") ? comm : "?")
+          n[k]++; total++
+          if (p <= 3) e[k]++; else if (p == 4) w[k]++
+          id = ""; comm = ""; p = 6; seen = 0
+        }
+        BEGIN { p = 6 }
+        /^__CURSOR=/          { seen = 1; next }
+        /^SYSLOG_IDENTIFIER=/ { id = substr($0, 19); next }
+        /^_COMM=/             { comm = substr($0, 7); next }
+        /^PRIORITY=/          { p = substr($0, 10) + 0; next }
+        /^$/                  { flush(); next }
+        END {
+          flush()
+          if (!total) exit 4   # nothing printed; finish says "-- No entries --"
+          printf "  COUNT  SHARE    ERR   WARN  SOURCE\n"
+          fflush()
+          cmd = "sort -k1,1nr | head -n " limit
+          for (k in n) { printf "%7d %5.1f%% %6d %6d  %s\n", n[k], 100 * n[k] / total, e[k], w[k], k | cmd; sources++ }
+          close(cmd)
+          printf "%7d entries from %d sources\n", total, sources
+        }'
+    st=("${PIPESTATUS[@]}"); } || true
+  finish 0 "${st[@]}"
+}
+
+cmd_vacuum() {
+  local v=${1:-} mode val what
+  [[ -n $v ]] || die "size or age missing (e.g. jx vacuum 500M or jx vacuum 2weeks)"
+  shift
+  if [[ $v =~ ^([0-9]+(\.[0-9]+)?)([KMGT])(i?B)?$ ]]; then
+    mode=size val="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+    what="delete archived journal files until the journal uses at most $val"
+  elif [[ $v =~ ^[0-9]+(s|sec|seconds?|min|minutes?|h|hr|hours?|d|days?|w|weeks?|months?|y|years?)$ ]]; then
+    mode=time val=$v
+    what="delete archived journal files with entries older than $v"
+  else
+    die "ambiguous or invalid value '$v': use a size like 500M or 2G, or an age like 30min, 12h, 2weeks, 6months"
+  fi
+  "${SUDO_READ[@]}" journalctl --disk-usage
+  confirm "This will $what. Continue?" || die "aborted"
+  "${SUDO_ROOT[@]}" journalctl "--vacuum-$mode=$val" "$@"
+  "${SUDO_ROOT[@]}" journalctl --disk-usage
+}
+
+cmd_exe() {
+  local name=${1:-} path
+  [[ -n $name ]] || die "binary missing (e.g. jx exe sshd or jx exe /usr/sbin/sshd)"
+  shift
+  if [[ $name == */* ]]; then
+    path=$name
+  else
+    path=$(PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin:/usr/libexec" type -P -- "$name") \
+      || die "'$name' not found in PATH"
+  fi
+  path=$(readlink -f -- "$path")
+  [[ -f $path ]] || die "'$path' does not exist"
+  take_boot "$@"; set -- "${REST[@]}"
+  set_boot
+  jc "${BSEL[@]}" "$path" "$@"
+}
+
+cmd_export() {
+  local f=${1:-} tmp
+  [[ -n $f && $f != -* ]] || die "target file missing (e.g. jx export boot.log -1)"
+  shift
+  take_boot "$@"; set -- "${REST[@]}"
+  set_boot
+  [[ ! -d $f ]] || die "'$f' is a directory"
+  if [[ -e $f ]]; then confirm "'$f' exists. Overwrite?" || die "aborted"; fi
+  # Write next to the target and rename only on success, so a failed export
+  # (e.g. a boot that doesn't exist) leaves an existing file untouched.
+  tmp=$(mktemp -- "$f.XXXXXX") || die "cannot write to '$(dirname -- "$f")'"
+  TMPFILES+=("$tmp")
+  chmod =rw -- "$tmp"   # the usual mode for a new file (umask), not mktemp's 600
+  "${SUDO_READ[@]}" journalctl "${BSEL[@]}" -q --no-pager -o short-iso "$@" > "$tmp" \
+    || die "export failed"
+  mv -f -- "$tmp" "$f"
+  echo "Wrote $f ($(wc -l < "$f") lines)"
+}
+
+# ---------------------------------------------------------------- dispatch
+
+cmd=${1:-help}
+[[ $# -gt 0 ]] && shift
+
+case $cmd in
+  -h|--help|help)        usage; exit 0 ;;
+  -v|--version|version)  echo "jx $VERSION"; exit 0 ;;
+  completion)
+    case ${1:-} in
+      bash) completion_bash ;;
+      zsh)  completion_zsh ;;
+      *)    die "usage: jx completion bash|zsh" ;;
+    esac
+    exit 0 ;;
+esac
+
+command -v journalctl >/dev/null 2>&1 || die "journalctl not found"
+ERRF=$(mktemp -t jx.XXXXXX) || die "cannot create a temporary file"
+TMPFILES+=("$ERRF")
+
+case $cmd in
+  boot)   take_boot "$@"; set -- "${REST[@]}"; set_boot; jc "${BSEL[@]}" "$@" ;;
+  boots)  STYLE=raw jc --list-boots "$@" ;;
+  err)    take_boot "$@"; set -- "${REST[@]}"; set_boot; jc "${BSEL[@]}" -p err "$@" ;;
+  warn)   take_boot "$@"; set -- "${REST[@]}"; set_boot; jc "${BSEL[@]}" -p warning "$@" ;;
+  kernel)
+    take_boot "$@"; set -- "${REST[@]}"
+    if [[ $BOOT == all ]]; then jc _TRANSPORT=kernel "$@"; else jc -k -b "$BOOT" "$@"; fi ;;
+  tail)
+    n=50
+    [[ ${1:-} =~ ^[0-9]+$ ]] && { n=$1; shift; }
+    NOPAGER=1 jc -n "$n" "$@" ;;
+  follow)
+    if [[ -n ${1:-} && $1 != -* ]]; then u=$1; shift; jc -f -u "$u" "$@"; else jc -f "$@"; fi ;;
+
+  unit)
+    [[ -n ${1:-} && $1 != -* ]] || die "unit name missing (e.g. jx unit nginx)"
+    u=$1; shift
+    if [[ -n ${1:-} && $1 != -* ]]; then
+      since=$1; shift; jc -u "$u" --since "$since" "$@"
+    else
+      jc -u "$u" -e "$@"
+    fi ;;
+  since)
+    [[ -n ${1:-} ]] || die "start time missing (e.g. jx since \"08:00\")"
+    from=$1; shift
+    if [[ -n ${1:-} && $1 != -* ]]; then
+      until=$1; shift; jc --since "$from" --until "$until" "$@"
+    else
+      jc --since "$from" "$@"
+    fi ;;
+  last)
+    [[ ${1:-} =~ ^[0-9] ]] || die "duration missing (e.g. 30min, 2h, 1d)"
+    d=$1; shift
+    jc --since "-$d" "$@" ;;
+  grep)
+    [[ -n ${1:-} ]] || die "search pattern missing"
+    pattern=$1; shift
+    take_boot "$@"; set -- "${REST[@]}"
+    set_boot
+    HL=$pattern HL_FLAGS=i
+    jc "${BSEL[@]}" --grep "$pattern" --case-sensitive=false "$@" ;;
+  pid)
+    [[ ${1:-} =~ ^[0-9]+$ ]] || die "PID missing or not a number"
+    p=$1; shift
+    take_boot "$@"; set -- "${REST[@]}"
+    set_boot
+    jc "${BSEL[@]}" "_PID=$p" "$@" ;;
+  exe)    cmd_exe "$@" ;;
+  user)   SUDO_READ=(); jc --user -e "$@" ;;
+  ssh)
+    HL='Accepted|Failed|Invalid' HL_FLAGS=""
+    jc -u ssh.service -u sshd.service -u 'sshd@*' --since today --grep "$HL" "$@" ;;
+
+  failed) paged cmd_failed "$@" ;;
+  crash)
+    BOOT=-1
+    take_boot "$@"; set -- "${REST[@]}"
+    [[ $BOOT != all ]] || die "crash needs a single boot, not 'all'"
+    paged cmd_crash "$@" ;;
+  top)    take_boot "$@"; set -- "${REST[@]}"; set_boot; cmd_top "$@" ;;
+
+  disk)   "${SUDO_READ[@]}" journalctl --disk-usage ;;
+  vacuum) cmd_vacuum "$@" ;;
+  verify) "${SUDO_READ[@]}" journalctl --verify "$@" ;;
+  rotate) "${SUDO_ROOT[@]}" journalctl --rotate "$@" ;;
+
+  json)
+    [[ -n ${1:-} && $1 != -* ]] || die "unit missing (e.g. jx json nginx 50)"
+    u=$1; shift
+    n=20
+    [[ ${1:-} =~ ^[0-9]+$ ]] && { n=$1; shift; }
+    "${SUDO_READ[@]}" journalctl -u "$u" -n "$n" -o json-pretty --no-pager "$@" ;;
+  export) cmd_export "$@" ;;
+
+  *) die "unknown command '$cmd' (see jx help)" ;;
+esac
