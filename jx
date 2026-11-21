@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -euo pipefail
 
-VERSION="0.2"
+VERSION="0.3"
 
 die() { echo "jx: $*" >&2; exit 1; }
 
@@ -19,14 +19,17 @@ STYLE=${JX_STYLE:-columns}   # columns | compact | raw
 NOPAGER=${JX_NOPAGER:-0}
 ASSUME_YES=0
 
-# Global flags may appear anywhere; everything else is kept in order.
-args=()
+# Global flags may appear anywhere before "--"; everything else is kept in
+# order. Arguments after "--" are kept as they are: jx grep -- --yes
+args=() verbatim=0
 for a in "$@"; do
+  if [[ $verbatim == 1 ]]; then args+=("$a"); continue; fi
   case $a in
     --raw)      STYLE=raw ;;
     --compact)  STYLE=compact ;;
     --no-pager) NOPAGER=1 ;;
     -y|--yes)   ASSUME_YES=1 ;;
+    --)         verbatim=1 ;;
     *)          args+=("$a") ;;
   esac
 done
@@ -42,20 +45,40 @@ COLOR=0
 BOLD="" RED="" RST=""
 if [[ $COLOR == 1 ]]; then BOLD=$'\e[1m' RED=$'\e[1;31m' RST=$'\e[0m'; fi
 
-# Reading needs root unless the user is in a journal-reading group.
+# Root on behalf of another user (sudo, sudo-rs, doas, pkexec, su)? Then the
+# pager must not offer shell escapes, and JX_PAGER, which may come from that
+# user's environment, is not run. systemd's own pager does the same.
+ELEVATED=0
+if [[ $EUID -eq 0 ]]; then
+  if [[ -n ${SUDO_USER:-}${DOAS_USER:-}${PKEXEC_UID:-} ]]; then
+    ELEVATED=1
+  elif [[ -r /proc/self/loginuid ]] && loginuid=$(< /proc/self/loginuid) \
+       && [[ $loginuid != 0 && $loginuid != 4294967295 ]]; then
+    ELEVATED=1   # logged in as someone else, e.g. su
+  fi
+fi
+
+# Reading the system journal needs root unless its files are readable for
+# you. Ask the files (ACLs included) instead of guessing from group names:
+# which groups may read differs between distributions (wheel on Fedora and
+# Arch, adm on Debian and Ubuntu, systemd-journal everywhere).
 # Changing the journal (vacuum, rotate) always needs root.
-SUDO_READ=() SUDO_ROOT=()
-in_log_group() {
-  local g groups
-  read -ra groups <<< "$(id -nG)"
-  for g in "${groups[@]}"; do
-    [[ $g == systemd-journal || $g == adm || $g == wheel ]] && return 0
+system_journal_readable() {
+  local mid d
+  [[ -r /etc/machine-id ]] && mid=$(< /etc/machine-id) || return 1
+  for d in /var/log/journal /run/log/journal; do
+    if [[ -e $d/$mid/system.journal ]]; then [[ -r $d/$mid/system.journal ]]; return; fi
   done
   return 1
 }
-if [[ $EUID -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
-  SUDO_ROOT=(sudo)
-  in_log_group || SUDO_READ=(sudo)
+SUDO_READ=() SUDO_ROOT=() LIMITED=0
+if [[ $EUID -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO_ROOT=(sudo)
+    system_journal_readable || SUDO_READ=(sudo)
+  elif ! system_journal_readable; then
+    LIMITED=1   # journalctl then shows only your own messages; warned about below
+  fi
 fi
 
 # Ask for the sudo password up front so the prompt doesn't fight the pager.
@@ -71,46 +94,108 @@ confirm() {
 
 # ---------------------------------------------------------------- output
 
-FIELDS=PRIORITY,SYSLOG_IDENTIFIER,_COMM,_SYSTEMD_UNIT,MESSAGE
-HL="" HL_FLAGS=""   # regex to highlight in the columns view (grep, ssh)
+FIELDS=PRIORITY,SYSLOG_IDENTIFIER,_COMM,_SYSTEMD_UNIT,_TRANSPORT,MESSAGE
+# regexes to highlight in the columns view: HL in red (grep, ssh), HL_OK in green (ssh)
+HL="" HL_FLAGS="" HL_OK=""
+
+# jq definitions shared by the columns view and top. Log entries are untrusted
+# input: any program can write them, with any fields and any bytes.
+# (The jq programs are single-quoted on purpose: their $names are jq's.)
+# shellcheck disable=SC2016
+JQ_DEFS='
+def c($code): if $color == "1" and $code != "" then "\u001b[" + $code + "m" else "" end;
+# journalctl -o json gives a field as an array of bytes when it is not printable
+# UTF-8 (escape sequences, control characters, invalid UTF-8). utf8 decodes the
+# bytes as UTF-8: plain ASCII directly, anything else via base64.
+def utf8:
+  if all(.[]; . < 128) then implode
+  else
+    ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" | explode) as $abc
+    | . as $b
+    | [range(0; $b | length; 3) as $i
+       | $b[$i:$i+3] as $g
+       | (($g[0] // 0) * 65536 + ($g[1] // 0) * 256 + ($g[2] // 0)) as $n
+       | ([$n / 262144, $n / 4096, $n / 64, $n] | map(floor % 64 | $abc[.]))[0:($g | length) + 1]
+         + [61, 61][0:3 - ($g | length)]]
+    | add // [] | implode | @base64d
+  end;
+# clean makes sure a field can neither control nor fool the terminal: escape
+# sequences (colors, titles, cursor movement) are dropped, other control
+# characters are shown as ^X, and invisible or text-direction characters
+# (U+200B, U+202E, ...) as <U+XXXX>. It is a single pass over the characters,
+# so its time grows linearly with the length; plain text is returned as it is.
+def hex: if . < 16 then "0123456789ABCDEF"[.:. + 1] else (. / 16 | floor | hex) + (. % 16 | hex) end;
+def invisible:
+  . == 173 or . == 1564 or . == 6158 or (. >= 8203 and . <= 8207) or (. >= 8232 and . <= 8238)
+  or (. >= 8288 and . <= 8292) or (. >= 8294 and . <= 8297) or . == 65279
+  or (. >= 917504 and . <= 917631);
+def shown:   # a character outside escape sequences -> [next state, characters to show]
+  if . == 27 then [1, []]
+  elif . == 9 or . == 10 then [0, [.]]
+  elif . < 32 then [0, [94, . + 64]]
+  elif . == 127 then [0, [94, 63]]
+  elif . >= 128 and . <= 159 then [0, [65533]]
+  elif invisible then [0, ("<U+" + (hex | ("000" + .)[-([length, 4] | max):]) + ">" | explode)]
+  else [0, [.]] end;
+# states: 0 text, 1 after ESC, 2 in a CSI sequence (ESC [), 3 in an OSC
+# sequence (ESC ]), 4 after ESC inside an OSC sequence; -1 marks the end
+def clean:
+  if test("[\\x00-\\x08\\x0b-\\x1f\\x7f-\\x{9f}\\x{ad}\\x{61c}\\x{180e}\\x{200b}-\\x{200f}\\x{2028}-\\x{202e}\\x{2060}-\\x{2064}\\x{2066}-\\x{2069}\\x{feff}\\x{e0000}-\\x{e007f}]") | not
+  then .
+  else
+    [foreach (explode[], -1) as $ch ([0, []];
+       .[0] as $s
+       | if $ch == -1 then [0, (if $s == 1 or $s == 4 then [94, 91] else [] end)]
+         elif $s == 0 then $ch | shown
+         elif $s == 2 then
+           if $ch >= 32 and $ch <= 63 then [2, []] elif $ch >= 64 and $ch <= 126 then [0, []] else $ch | shown end
+         elif $s == 3 then
+           if $ch == 7 then [0, []] elif $ch == 27 then [4, []] else [3, []] end
+         elif $ch == 91 then [2, []]
+         elif $ch == 93 then [3, []]
+         elif $s == 4 and $ch == 92 then [0, []]
+         else ($ch | shown) as $r | [$r[0], [94, 91] + $r[1]] end;
+       .[1][])]
+    | implode
+  end;
+# longest field shown; the rest of a huge one would only cost time
+def maxlen: 65536;
+def val:
+  if type == "array" then
+    if length > 0 and (.[0] | type) == "number" then
+      length as $n | .[0:maxlen] | utf8 | clean | if $n > maxlen then . + " … [cut, \($n) bytes]" else . end
+    else map(val) | join(" ") end
+  elif type == "string" then
+    if length > maxlen then (.[0:maxlen] | clean) + " … [cut]" else clean end
+  elif . == null then "" else tostring end;
+def prio: (try (.PRIORITY | if type == "string" then tonumber else val | tonumber end) catch 6)
+          | if . < 0 or . > 7 then 6 else . end;
+# The source is the name a program gives itself (SYSLOG_IDENTIFIER): any
+# program can choose any name. Only "kernel" can be checked, against the
+# transport, which journald sets: a program posing as the kernel is shown as
+# kernel(its process name). A source stays on one line, as a newline in it
+# would start a line of its own that could pass for a log entry.
+def fake_kernel: .SYSLOG_IDENTIFIER == "kernel" and ._TRANSPORT != "kernel";
+def src: if fake_kernel then "kernel(" + (._COMM // "?" | val) + ")"
+         else .SYSLOG_IDENTIFIER // ._COMM // ._SYSTEMD_UNIT // "?" | val end
+         | split("\n") | join("^J") | split("\t") | join("^I");
+'
 
 # jq program for the columns view: time, level, source, message;
 # a separator line whenever the day or the boot changes.
 # It prints nothing when there are no entries, so jq -e exits 4 (see finish).
+# shellcheck disable=SC2016
 JQ_COLUMNS='
-def c($code): if $color == "1" and $code != "" then "\u001b[" + $code + "m" else "" end;
-# journalctl -o json gives a field as an array of bytes when it is not printable
-# UTF-8 (escape sequences, control characters, invalid UTF-8). utf8 decodes the
-# bytes as UTF-8 (via base64), clean drops escape sequences and shows other
-# control characters as ^X, so a log entry cannot control the terminal.
-def utf8:
-  ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" | explode) as $abc
-  | . as $b
-  | [range(0; $b | length; 3) as $i
-     | $b[$i:$i+3] as $g
-     | (($g[0] // 0) * 65536 + ($g[1] // 0) * 256 + ($g[2] // 0)) as $n
-     | ([$n / 262144, $n / 4096, $n / 64, $n] | map(floor % 64 | $abc[.]))[0:($g | length) + 1]
-       + [61, 61][0:3 - ($g | length)]]
-  | add // [] | implode | @base64d;
-def clean:
-  gsub("\\x1b\\[[0-?]*[ -/]*[@-~]|\\x1b\\][^\\x07\\x1b]*(\\x07|\\x1b\\\\)?"; "")
-  | gsub("(?<c>[\\x00-\\x08\\x0b-\\x1f\\x7f\\x{80}-\\x{9f}])";
-         .c | explode | .[0]
-         | if . < 32 then "^" + ([. + 64] | implode) elif . == 127 then "^?" else "�" end);
-def val: if type == "array" then
-           (if length > 0 and (.[0] | type) == "number" then utf8 | clean else map(val) | join(" ") end)
-         elif . == null then "" else tostring end;
-def prio: (try (.PRIORITY | val | tonumber) catch 6) | if . < 0 or . > 7 then 6 else . end;
 def lvl: ["EMERG","ALERT","CRIT","ERR","WARN","NOTE","INFO","DEBUG"][.];
 def lcol: if . <= 3 then "1;31" elif . == 4 then "33" elif . == 5 then "1" elif . == 7 then "2" else "" end;
 def fit($n): if length <= $n then . + (" " * ($n - length)) else .[0:$n-1] + "…" end;
 def shorten($n): if length <= $n then . elif test("\\.") then (split(".")[1:] | join(".") | shorten($n)) else . end;
-def src: (.SYSLOG_IDENTIFIER // ._COMM // ._SYSTEMD_UNIT // "?") | val | shorten(20);
-def hilite:
-  if $hl == "" or $color != "1" then .
-  else . as $s | try (if ("" | test($hl; $hlflags)) then $s
-                      else gsub("(?<m>" + $hl + ")"; c("1;31") + .m + c("0"); $hlflags) end)
+def mark($re; $flags; $code):
+  if $re == "" or $color != "1" then .
+  else . as $s | try (if ("" | test($re; $flags)) then $s
+                      else gsub("(?<m>" + $re + ")"; c($code) + .m + c("0"); $flags) end)
                  catch $s end;
+def hilite: mark($hl; $hlflags; "1;31") | mark($hlok; $hlflags; "1;32");
 def header($text): c("1") + "── " + $text + " " + ("─" * ([56 - ($text | length), 3] | max)) + c("0");
 
 foreach inputs as $e (
@@ -127,7 +212,7 @@ foreach inputs as $e (
             else "" end)
       + ($t | strflocaltime("%H:%M:%S")) + "  "
       + c($p | lcol) + ($p | lvl | fit(5)) + c("0") + "  "
-      + c("36") + ($e | src | fit(20)) + c("0") + " "
+      + c("36") + ($e | src as $s | if fake_kernel then $s else $s | shorten(20) end | fit(20)) + c("0") + " "
       + ($lines[0] // "" | hilite)
       + ($lines[1:] | map("\n" + (" " * 38) + hilite) | join(""))
   | .day = $d | .boot = $b | .n += 1;
@@ -135,8 +220,58 @@ foreach inputs as $e (
 )
 '
 
+# jq program for top: entries, errors and warnings per source, most first.
+# shellcheck disable=SC2016
+JQ_TOP='
+def lpad($n): tostring | (" " * ($n - length)) + .;
+def cut($n): if length <= $n then . else .[0:$n - 1] + "…" end;
+reduce inputs as $e ({};
+  ($e | src) as $k | ($e | prio) as $p
+  | .[$k] |= (.n += 1 | if $p <= 3 then .e += 1 elif $p == 4 then .w += 1 else . end))
+| (to_entries | sort_by(-.value.n, .key)) as $rows
+| ($rows | map(.value.n) | add) as $total
+| if $total == null then empty   # no entries: jq -e exits 4 (see finish)
+  else
+    "  COUNT  SHARE    ERR   WARN  SOURCE",
+    ($rows[:($limit | tonumber)][]
+     | (.value.n * 1000 / $total + 0.5 | floor) as $pm
+     | "\(.value.n | lpad(7)) \("\($pm / 10 | floor).\($pm % 10)" | lpad(5))% "
+       + "\(.value.e // 0 | lpad(6)) \(.value.w // 0 | lpad(6))  \(.key | cut(60))"),
+    "\($total | lpad(7)) entries from \($rows | length) sources"
+  end
+'
+
+# jqf PROGRAM [JQ OPTIONS...] - run one of the programs above.
+# jq may use at most 1 GiB (normally it needs a few MB): journald accepts
+# fields of up to 768 MiB from any local program, and jq holds a whole entry
+# in memory, so one such entry could otherwise take many gigabytes. jq then
+# aborts (exit 134, see finish); the messages of this subshell about that go
+# to /dev/null, jq's own to stderr.
+jqf() (
+  prog=$1
+  shift
+  ulimit -v 1048576 2>/dev/null || true
+  ulimit -c 0 2>/dev/null || true
+  jq -n -r -e --arg color "$COLOR" --arg hl "$HL" --arg hlflags "$HL_FLAGS" --arg hlok "$HL_OK" \
+     --arg limit "${JX_TOP:-20}" "$@" "$JQ_DEFS$prog" 2>&3
+) 3>&2 2>/dev/null
+
 page() {   # $1 = 1 to start at the end
-  if [[ -n ${JX_PAGER:-} ]]; then sh -c "$JX_PAGER"; return; fi
+  # jx always writes UTF-8 (the ── separators, …). If the locale is unset, C or
+  # not installed, less would show those bytes as <E2><94><80>, so say UTF-8
+  # unless the user chose a charset; journalctl's own pager does the same.
+  local LESSCHARSET=${LESSCHARSET:-utf-8}
+  export LESSCHARSET
+  if [[ $ELEVATED == 1 ]]; then
+    # no shell commands, pipes or saving to files from within less; and no
+    # LESSSECURE_ALLOW from the caller's environment to turn them back on
+    local LESSSECURE=1
+    export LESSSECURE
+    unset LESSSECURE_ALLOW
+    [[ -z ${JX_PAGER:-} ]] || echo "jx: JX_PAGER is ignored when running as root for another user" >&2
+  elif [[ -n ${JX_PAGER:-} ]]; then
+    sh -c "$JX_PAGER"; return
+  fi
   command -v less >/dev/null 2>&1 || { cat; return; }
   local opts=(-FRXMK)
   [[ ${1:-0} == 1 ]] && opts+=(+G)
@@ -148,18 +283,31 @@ paged() {
   if [[ $NOPAGER == 1 || ! -t 1 ]]; then "$@"; return; fi
   sudo_warm
   local rc=0
-  { NOPAGER=1; "$@"; } | page 0 || rc=$?
+  NOPAGER=1 "$@" | page 0 || rc=$?
   [[ $rc == 0 || $rc == 141 ]] || return "$rc"
 }
 
 # jc [journalctl args...] - read the journal in the selected style
 jc() {
-  local style=$STYLE follow=0 end=0 a
+  local style=$STYLE follow=0 end=0 prev="" a i
+  readonly_args "$@"
   for a in "$@"; do
+    if takes_value "$prev"; then prev=""; continue; fi   # an option's value
+    [[ $a == -- ]] && break
+    prev=$a
     case $a in
-      -o|-o?*|--output|--output=*|-x|--catalog) style=raw ;;   # explicit format wins
-      -f|--follow)     follow=1 ;;
-      -e|--pager-end)  end=1 ;;
+      --*) if [[ ${a%%=*} == --output ]] || opt_is "$a" catalog; then style=raw   # explicit format wins
+           elif opt_is "$a" follow; then follow=1
+           elif opt_is "$a" pager-end; then end=1
+           fi ;;
+      -?*) for ((i = 1; i < ${#a}; i++)); do   # short options, maybe bundled: -qo json, -ef
+             case ${a:i:1} in
+               o|x) style=raw ;;
+               f)   follow=1 ;;
+               e)   end=1 ;;
+             esac
+             [[ ${a:i:1} == [bnMDiSUcutTpgoF] ]] && break   # the rest is that option's value
+           done ;;
     esac
   done
   if [[ $style == columns ]] && ! command -v jq >/dev/null 2>&1; then style=compact; fi
@@ -174,27 +322,30 @@ jc() {
     return
   fi
 
-  # -a: without it journalctl -o json leaves out messages longer than 4 KiB
+  # -a: without it journalctl -o json leaves out fields over 4 KiB, such as
+  # the stack traces of systemd-coredump. jqf bounds what that can cost.
   local jargs=(-q -a -o json --output-fields="$FIELDS" "$@")
-  local jqargs=(-n -r -e --arg color "$COLOR" --arg hl "$HL" --arg hlflags "$HL_FLAGS")
   local st=()
   : > "$ERRF"
   if [[ $follow == 1 ]]; then   # live: errors are shown right away
     { "${SUDO_READ[@]}" journalctl "${jargs[@]}" \
-        | jq "${jqargs[@]}" --unbuffered "$JQ_COLUMNS"
+        | jqf "$JQ_COLUMNS" --unbuffered
       st=("${PIPESTATUS[@]}"); } || true
   elif [[ $NOPAGER == 1 || ! -t 1 ]]; then
     { "${SUDO_READ[@]}" journalctl "${jargs[@]}" 2>"$ERRF" \
-        | jq "${jqargs[@]}" "$JQ_COLUMNS"
+        | jqf "$JQ_COLUMNS"
       st=("${PIPESTATUS[@]}"); } || true
   else
     sudo_warm
     { "${SUDO_READ[@]}" journalctl "${jargs[@]}" 2>"$ERRF" \
-        | jq "${jqargs[@]}" "$JQ_COLUMNS" | page "$end"
+        | jqf "$JQ_COLUMNS" | page "$end"
       st=("${PIPESTATUS[@]}"); } || true
   fi
   finish "$follow" "${st[@]}"
 }
+
+# jc_user ARGS... - jc on your own user journal, which needs no sudo
+jc_user() { local SUDO_READ=(); jc --user "$@"; }
 
 # finish QUIET JOURNALCTL_RC FORMATTER_RC [PAGER_RC]
 # Ends a "journalctl | formatter [| pager]" pipeline whose journalctl wrote its
@@ -205,6 +356,9 @@ finish() {
   local quiet=$1 failed=0 s
   shift
   if [[ -s $ERRF ]]; then cat -- "$ERRF" >&2; failed=1; fi
+  if [[ ${2:-0} == 134 ]]; then
+    echo "jx: stopped at a log entry too large to format (jq may use 1 GiB); --raw shows it as blob data" >&2
+  fi
   if [[ ${2:-0} == 4 ]]; then
     set -- "$1" 0 "${@:3}"
     [[ $quiet == 1 || $failed == 1 ]] || echo "-- No entries --"
@@ -214,18 +368,65 @@ finish() {
   done
 }
 
+# ---------------------------------------------------------------- journalctl options
+
+# opt_is ARG NAME... - is ARG the long option --NAME, with or without =VALUE?
+# getopt also accepts any unique abbreviation (--vacuum-t=1s), so does this.
+opt_is() {
+  local a=${1%%=*} n
+  shift
+  [[ $a == --?* ]] || return 1
+  a=${a#--}
+  for n; do [[ $n == "$a"* ]] && return 0; done
+  return 1
+}
+
+# long options whose value may be the next argument
+VALUE_OPTS=(boot lines machine directory file root image image-policy namespace since until
+  cursor after-cursor cursor-file invocation unit user-unit identifier exclude-identifier
+  priority facility grep output output-fields field interval verify-key
+  vacuum-size vacuum-time vacuum-files)
+
+# Does journalctl read the argument after option $1 as that option's value?
+# In a bundle of short options (-qu) the first one that takes a value gets
+# the rest of the bundle, or the next argument if it is the last one.
+takes_value() {
+  local a=$1 i
+  case $a in
+    --*=*|--) return 1 ;;
+    --user)   return 1 ;;   # a switch, although --user-unit starts the same
+    --?*)     opt_is "$a" "${VALUE_OPTS[@]}" ;;
+    -?*)      for ((i = 1; i < ${#a}; i++)); do
+                if [[ ${a:i:1} == [bnMDiSUcutTpgoF] ]]; then (( i == ${#a} - 1 )); return; fi
+              done
+              return 1 ;;
+    *)        return 1 ;;
+  esac
+}
+
+# Options that change the journal or write a file. The reading commands refuse
+# them: under sudo they would run as root, without the questions jx vacuum asks.
+# Every argument is checked, values and anything after "--" included: whether
+# journalctl reads an argument as a value depends on it (-b, -n), and "--" can
+# itself be a value (-u --). A unit or pattern named like one of these is
+# refused too, which is the safe side.
+WRITE_OPTS=(vacuum-size vacuum-time vacuum-files rotate flush sync relinquish-var
+  smart-relinquish-var setup-keys update-catalog cursor-file)
+readonly_args() {
+  local a
+  for a; do
+    if [[ ${a%%=*} != --cursor ]] && opt_is "$a" "${WRITE_OPTS[@]}"; then
+      die "refusing '$a': it changes the journal or writes a file (use jx vacuum, jx rotate or journalctl itself)"
+    fi
+  done
+}
+
 # ---------------------------------------------------------------- boot selector
 
 # N may be an offset (0, -1, +1, ...), a boot ID (optionally with an offset),
 # or "all".
 BOOT=0 BSEL=() REST=()
 is_boot() { [[ ${1:-} =~ ^([+-]?[0-9]+|all|[0-9a-fA-F]{32}([+-][0-9]+)?)$ ]]; }
-
-# Does journalctl read the argument after option $1 as that option's value?
-takes_value() {
-  [[ $1 =~ ^-[A-Za-z]*[bnMDiSUcutTpgoF]$ ||
-     $1 =~ ^--(boot|lines|machine|directory|file|root|image|image-policy|namespace|since|until|cursor|after-cursor|cursor-file|invocation|unit|user-unit|identifier|exclude-identifier|priority|facility|grep|output|output-fields|field)$ ]]
-}
 
 # take_boot ARGS... - move the boot selector N out of ARGS into BOOT and leave
 # the other arguments in REST. N is normally the first argument, but a negative
@@ -276,7 +477,7 @@ Filtering
   pid <pid> [N]          Logs of a process in boot N
   exe <name|path> [N]    Logs of a binary in boot N, e.g. jx exe sshd
   user                   Logs of your user units
-  ssh                    SSH logins and failures today
+  ssh                    SSH logins, failures and probes of the last 24 hours
 
 Diagnosis
   failed                 Failed units with their last 20 lines
@@ -303,6 +504,7 @@ Flags
   --compact              journalctl output without hostname (JX_STYLE=compact)
   --no-pager             No pager (also: JX_NOPAGER=1)
   -y, --yes              Don't ask for confirmation (vacuum, export)
+  --                     Take what follows as it is, e.g. jx grep -- --yes
 EOF
 }
 
@@ -312,10 +514,10 @@ completion_bash() {
   cat <<'EOF'
 # bash completion for jx - load with:  source <(jx completion bash)
 _jx_units() {
-  local u
-  u=$(journalctl -F _SYSTEMD_UNIT 2>/dev/null)
-  [[ -n $u ]] || u=$(systemctl list-units --all --plain --no-legend 2>/dev/null | awk '{print $1}')
-  sed 's/\.service$//' <<< "$u"
+  local -a u
+  mapfile -t u < <(journalctl -F _SYSTEMD_UNIT 2>/dev/null)
+  (( ${#u[@]} )) || mapfile -t u < <(systemctl list-units --all --plain --no-legend 2>/dev/null | awk '{print $1}')
+  printf '%s\n' "${u[@]%.service}"
 }
 _jx_boots() {
   local b
@@ -326,21 +528,22 @@ _jx() {
   local cur=${COMP_WORDS[COMP_CWORD]} i=1
   while (( i < COMP_CWORD )) && [[ ${COMP_WORDS[i]} == -* ]]; do ((i++)); done
   if (( COMP_CWORD == i )); then
-    COMPREPLY=($(compgen -W "boot boots err warn kernel tail follow unit since last grep pid exe user ssh
+    mapfile -t COMPREPLY < <(compgen -W "boot boots err warn kernel tail follow unit since last grep pid exe user ssh
       failed crash top disk vacuum verify rotate json export completion help version
-      --raw --compact --no-pager --yes" -- "$cur"))
+      --raw --compact --no-pager --yes" -- "$cur")
     return
   fi
-  local cmd=${COMP_WORDS[i]} pos=$(( COMP_CWORD - i ))
+  local cmd=${COMP_WORDS[i]} pos=$(( COMP_CWORD - i )) words=""
   case $cmd in
-    unit|follow|json)             (( pos == 1 )) && COMPREPLY=($(compgen -W "$(_jx_units)" -- "$cur")) ;;
-    boot|err|warn|kernel|crash|top) (( pos == 1 )) && COMPREPLY=($(compgen -W "$(_jx_boots)" -- "$cur")) ;;
-    grep|pid|export)              (( pos == 2 )) && COMPREPLY=($(compgen -W "$(_jx_boots)" -- "$cur")) ;;
-    exe) if (( pos == 1 )) && [[ $cur != */* ]]; then COMPREPLY=($(compgen -c -- "$cur"))
-         elif (( pos == 2 )); then COMPREPLY=($(compgen -W "$(_jx_boots)" -- "$cur")); fi ;;
-    vacuum)                       (( pos == 1 )) && COMPREPLY=($(compgen -W "500M 1G 2G 2weeks 1months 6months" -- "$cur")) ;;
-    completion)                   (( pos == 1 )) && COMPREPLY=($(compgen -W "bash zsh" -- "$cur")) ;;
+    unit|follow|json)               (( pos == 1 )) && words=$(_jx_units) ;;
+    boot|err|warn|kernel|crash|top) (( pos == 1 )) && words=$(_jx_boots) ;;
+    grep|pid|export)                (( pos == 2 )) && words=$(_jx_boots) ;;
+    exe) if (( pos == 1 )) && [[ $cur != */* ]]; then mapfile -t COMPREPLY < <(compgen -c -- "$cur")
+         elif (( pos == 2 )); then words=$(_jx_boots); fi ;;
+    vacuum)                         (( pos == 1 )) && words="500M 1G 2G 2weeks 1months 6months" ;;
+    completion)                     (( pos == 1 )) && words="bash zsh" ;;
   esac
+  [[ -z $words ]] || mapfile -t COMPREPLY < <(compgen -W "$words" -- "$cur")
   return 0
 }
 complete -o default -F _jx jx
@@ -440,29 +643,42 @@ cmd_failed() {
   done
   for u in "${uunits[@]}"; do
     printf '\n%s=== %s (user) ===%s\n' "$RED" "$u" "$RST"
-    ( SUDO_READ=(); jc --user -u "$u" -n 20 "$@" )
+    jc_user -u "$u" -n 20 "$@"
   done
 }
 
+# jread ARGS... - print what journalctl ARGS prints. If it fails, its error
+# is shown and jread fails: a failed query must never be taken for "no
+# entries".
+jread() {
+  "${SUDO_READ[@]}" journalctl "$@" 2>"$ERRF" && return 0
+  cat -- "$ERRF" >&2
+  return 1
+}
+
 cmd_crash() {
-  local line="" id idx first last target current
+  local out line id idx first last target current
   # journalctl resolves N (offsets, +N, boot IDs in either case, ID+N);
   # the boot list then gives its index and time range.
-  id=$("${SUDO_READ[@]}" journalctl -b "$BOOT" -q -n 1 -o export --output-fields=_BOOT_ID 2>/dev/null \
-         | sed -n 's/^_BOOT_ID=//p' || true)
-  if [[ -n $id ]]; then
-    line=$("${SUDO_READ[@]}" journalctl --list-boots --no-pager -q 2>/dev/null \
-             | awk -v id="$id" '$2 == id' || true)
-  fi
-  [[ -n $line ]] || die "boot $BOOT not found. Is the journal persistent? (see README, 'Persistent journal')"
+  out=$(jread -b "$BOOT" -q -n 1 -o export --output-fields=_BOOT_ID) \
+    || die "cannot read boot $BOOT. Is the journal persistent? (see README, 'Persistent journal')"
+  id=$(sed -n 's/^_BOOT_ID=//p' <<< "$out")
+  [[ -n $id ]] || die "boot $BOOT has no entries"
+  out=$(jread --list-boots --no-pager -q) || die "cannot list the boots"
+  line=$(awk -v id="$id" '$2 == id' <<< "$out")
+  [[ -n $line ]] || die "boot $id is missing from the boot list"
   read -r idx _ <<< "$line"
   first=$(awk '{print $3, $4, $5, $6}' <<< "$line")
   last=$(awk '{print $7, $8, $9, $10}' <<< "$line")
 
-  target=$("${SUDO_READ[@]}" journalctl -b "$id" -q -n 1 -o cat --output-fields=UNIT \
-             MESSAGE_ID=39f53479d3a045ac8e11786248231fbf \
+  # Reaching one of these targets is logged by PID 1, running as root. Any
+  # program can log MESSAGE_ID= and UNIT= itself, but _PID and _UID are set
+  # by journald, so a faked "clean shutdown" is not matched.
+  target=$(jread -b "$id" -q -n 1 -o cat --output-fields=UNIT \
+             MESSAGE_ID=39f53479d3a045ac8e11786248231fbf _PID=1 _UID=0 \
              UNIT=poweroff.target UNIT=reboot.target UNIT=halt.target \
-             UNIT=kexec.target UNIT=soft-reboot.target 2>/dev/null || true)
+             UNIT=kexec.target UNIT=soft-reboot.target) \
+    || die "cannot tell how boot $id ended"
 
   printf '%sBoot %s%s  %s\n' "$BOLD" "$idx" "$RST" "$id"
   printf '  from   %s\n  to     %s\n' "$first" "$last"
@@ -480,43 +696,26 @@ cmd_crash() {
   printf '\n%s── Last lines of that boot ──%s\n' "$BOLD" "$RST"
   jc -b "$id" -n 25 "$@"
   printf '\n%s── Coredumps during that boot ──%s\n' "$BOLD" "$RST"
-  if command -v coredumpctl >/dev/null 2>&1; then
-    "${SUDO_READ[@]}" coredumpctl list --no-pager "_BOOT_ID=$id" 2>/dev/null || echo "None."
-  else
+  if ! command -v coredumpctl >/dev/null 2>&1; then
     echo "coredumpctl not installed."
+  elif ! "${SUDO_READ[@]}" coredumpctl list --no-pager "_BOOT_ID=$id" 2>"$ERRF"; then
+    # coredumpctl also fails when there is just nothing to list
+    if grep -q '^No coredumps found' "$ERRF"; then echo "None."; else cat -- "$ERRF" >&2; fi
   fi
 }
 
 cmd_top() {
   local limit=${JX_TOP:-20} st=()
   [[ $limit =~ ^[1-9][0-9]*$ ]] || die "JX_TOP must be a positive number, not '$limit'"
+  command -v jq >/dev/null 2>&1 || die "top needs jq"
+  readonly_args "$@"
+  # JSON, not -o export: export writes fields with a newline as raw bytes,
+  # which a line-based parser would read as more entries (any program can log
+  # such a field). Source names are cleaned like in the columns view.
   : > "$ERRF"
-  { "${SUDO_READ[@]}" journalctl "${BSEL[@]}" -q -o export \
-      --output-fields=SYSLOG_IDENTIFIER,_COMM,PRIORITY "$@" 2>"$ERRF" \
-    | awk -v limit="$limit" '
-        function flush(  k) {
-          if (!seen) return
-          k = (id != "") ? id : ((comm != "") ? comm : "?")
-          n[k]++; total++
-          if (p <= 3) e[k]++; else if (p == 4) w[k]++
-          id = ""; comm = ""; p = 6; seen = 0
-        }
-        BEGIN { p = 6 }
-        /^__CURSOR=/          { seen = 1; next }
-        /^SYSLOG_IDENTIFIER=/ { id = substr($0, 19); next }
-        /^_COMM=/             { comm = substr($0, 7); next }
-        /^PRIORITY=/          { p = substr($0, 10) + 0; next }
-        /^$/                  { flush(); next }
-        END {
-          flush()
-          if (!total) exit 4   # nothing printed; finish says "-- No entries --"
-          printf "  COUNT  SHARE    ERR   WARN  SOURCE\n"
-          fflush()
-          cmd = "sort -k1,1nr | head -n " limit
-          for (k in n) { printf "%7d %5.1f%% %6d %6d  %s\n", n[k], 100 * n[k] / total, e[k], w[k], k | cmd; sources++ }
-          close(cmd)
-          printf "%7d entries from %d sources\n", total, sources
-        }'
+  { "${SUDO_READ[@]}" journalctl "${BSEL[@]}" -q -o json \
+      --output-fields=SYSLOG_IDENTIFIER,_COMM,_SYSTEMD_UNIT,_TRANSPORT,PRIORITY "$@" 2>"$ERRF" \
+    | jqf "$JQ_TOP"
     st=("${PIPESTATUS[@]}"); } || true
   finish 0 "${st[@]}"
 }
@@ -535,7 +734,9 @@ cmd_vacuum() {
     die "ambiguous or invalid value '$v': use a size like 500M or 2G, or an age like 30min, 12h, 2weeks, 6months"
   fi
   "${SUDO_READ[@]}" journalctl --disk-usage
-  confirm "This will $what. Continue?" || die "aborted"
+  # extra options can delete more than the question says: show the command
+  printf 'Command: journalctl %s\n' "--vacuum-$mode=$val${*:+ $*}"
+  confirm "This will $what${*:+, with the extra options above}. Continue?" || die "aborted"
   "${SUDO_ROOT[@]}" journalctl "--vacuum-$mode=$val" "$@"
   "${SUDO_ROOT[@]}" journalctl --disk-usage
 }
@@ -563,17 +764,19 @@ cmd_export() {
   shift
   take_boot "$@"; set -- "${REST[@]}"
   set_boot
+  readonly_args "$@"
   [[ ! -d $f ]] || die "'$f' is a directory"
   if [[ -e $f ]]; then confirm "'$f' exists. Overwrite?" || die "aborted"; fi
   # Write next to the target and rename only on success, so a failed export
   # (e.g. a boot that doesn't exist) leaves an existing file untouched.
+  # The file keeps mktemp's mode 600: the journal is readable only for root
+  # and log readers, and can hold passwords typed as user names, tokens, ...
   tmp=$(mktemp -- "$f.XXXXXX") || die "cannot write to '$(dirname -- "$f")'"
   TMPFILES+=("$tmp")
-  chmod =rw -- "$tmp"   # the usual mode for a new file (umask), not mktemp's 600
   "${SUDO_READ[@]}" journalctl "${BSEL[@]}" -q --no-pager -o short-iso "$@" > "$tmp" \
     || die "export failed"
   mv -f -- "$tmp" "$f"
-  echo "Wrote $f ($(wc -l < "$f") lines)"
+  echo "Wrote $f ($(wc -l < "$f") lines, readable only by you)"
 }
 
 # ---------------------------------------------------------------- dispatch
@@ -596,6 +799,11 @@ esac
 command -v journalctl >/dev/null 2>&1 || die "journalctl not found"
 ERRF=$(mktemp -t jx.XXXXXX) || die "cannot create a temporary file"
 TMPFILES+=("$ERRF")
+# journalctl -q would hide its own hint about this, so say it here
+if [[ $LIMITED == 1 && $cmd != user ]]; then
+  echo "jx: you cannot read the system journal and sudo is not installed, so you" \
+       "see only your own messages (see README, 'Permissions')" >&2
+fi
 
 case $cmd in
   boot)   take_boot "$@"; set -- "${REST[@]}"; set_boot; jc "${BSEL[@]}" "$@" ;;
@@ -646,22 +854,32 @@ case $cmd in
     set_boot
     jc "${BSEL[@]}" "_PID=$p" "$@" ;;
   exe)    cmd_exe "$@" ;;
-  user)   SUDO_READ=(); jc --user -e "$@" ;;
+  user)   jc_user -e "$@" ;;
   ssh)
-    HL='Accepted|Failed|Invalid' HL_FLAGS=""
-    jc -u ssh.service -u sshd.service -u 'sshd@*' --since today --grep "$HL" "$@" ;;
+    # Only the SSH units are read (Debian/Ubuntu, others, per connection,
+    # systemd's sshd-vsock@ etc.); _SYSTEMD_UNIT is set by journald, so other
+    # programs cannot add lines here. Logins are green only at the start of a
+    # message, so a user name like "Accepted ..." cannot pass for one.
+    HL_OK='^Accepted ' HL_FLAGS=""
+    HL='Failed |[Ii]nvalid user|[Aa]uthentication failure|maximum authentication attempts'
+    HL+='|(Disconnected from|Connection closed by) (authenticating|invalid) user|not allowed because'
+    HL+='|ROOT LOGIN REFUSED|refused connect|Unable to negotiate|banner exchange|kex_exchange_identification'
+    HL+='|Bad protocol version|Protocol major versions differ|Did not receive identification|penalty:'
+    jc -u ssh.service -u sshd.service -u 'ssh@*' -u 'sshd@*' -u 'sshd-*@*' --since -24h \
+       --grep "Accepted |$HL" "$@" ;;
 
-  failed) paged cmd_failed "$@" ;;
+  failed) readonly_args "$@"; paged cmd_failed "$@" ;;   # checked before any output
   crash)
     BOOT=-1
     take_boot "$@"; set -- "${REST[@]}"
     [[ $BOOT != all ]] || die "crash needs a single boot, not 'all'"
+    readonly_args "$@"
     paged cmd_crash "$@" ;;
   top)    take_boot "$@"; set -- "${REST[@]}"; set_boot; cmd_top "$@" ;;
 
   disk)   "${SUDO_READ[@]}" journalctl --disk-usage ;;
   vacuum) cmd_vacuum "$@" ;;
-  verify) "${SUDO_READ[@]}" journalctl --verify "$@" ;;
+  verify) readonly_args "$@"; "${SUDO_READ[@]}" journalctl --verify "$@" ;;
   rotate) "${SUDO_ROOT[@]}" journalctl --rotate "$@" ;;
 
   json)
@@ -669,6 +887,7 @@ case $cmd in
     u=$1; shift
     n=20
     [[ ${1:-} =~ ^[0-9]+$ ]] && { n=$1; shift; }
+    readonly_args "$@"
     "${SUDO_READ[@]}" journalctl -u "$u" -n "$n" -o json-pretty --no-pager "$@" ;;
   export) cmd_export "$@" ;;
 

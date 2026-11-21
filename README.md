@@ -28,7 +28,7 @@ In a terminal, levels are colored (ERR red, WARN yellow) and the source is cyan.
 
 - Linux with systemd (`journalctl`, `systemctl`)
 - Bash 4.4+
-- `jq` 1.6+ for the column layout (optional; without it jx falls back to the compact style)
+- `jq` 1.6+ for the column layout and `top` (optional otherwise; without it jx falls back to the compact style)
 - `less` as pager (optional)
 - `sudo` if your user isn't in `systemd-journal`, `adm` or `wheel`
 
@@ -65,7 +65,7 @@ jx [--raw|--compact] [--no-pager] [--yes] <command> [arguments] [journalctl opti
 
 **Boot selector `N`:** `0` = current boot (default), `-1` = previous, `-2` = the one before, `+1` = the first recorded boot, a boot ID from `jx boots`, or `all` for every boot. N goes right after the command (after the pattern, PID, binary or file for `grep`, `pid`, `exe`, `export`). A negative N is also recognized further back, so `jx err -q -1` works like `jx err -1 -q`.
 
-**Extra options go to journalctl.** Anything after a command's own arguments is passed through, so every command can be narrowed further:
+**Extra options go to journalctl.** Anything after a command's own arguments is passed through, so every command can be narrowed further. Options that change the journal or write a file (`--vacuum-*`, `--rotate`, `--flush`, `--sync`, `--relinquish-var`, `--setup-keys`, `--update-catalog`, `--cursor-file`, also abbreviated) are refused there, since with `sudo` they would run as root without any question; use `jx vacuum`, `jx rotate` or journalctl itself.
 
 ```bash
 jx err -1 -u nginx                 # errors of nginx in the previous boot
@@ -98,9 +98,11 @@ jx top -1 -p warning               # who warned most in the previous boot
 | `jx pid <pid> [N]` | Logs of a process (current boot by default, as PIDs are reused) | `-b N _PID=pid` |
 | `jx exe <name\|path> [N]` | Logs of a binary; names are looked up in `PATH` and `sbin` | `-b N /path/to/bin` |
 | `jx user` | Your user units | `--user -e` |
-| `jx ssh` | Today's SSH logins and failures, keywords highlighted | `-u ssh -u sshd -u 'sshd@*' --since today --grep …` |
+| `jx ssh` | SSH logins (green), failures and probes (red) of the last 24 hours | `-u ssh -u sshd -u 'ssh@*' -u 'sshd@*' -u 'sshd-*@*' --since -24h --grep …` |
 
 `--since`/`--until` take anything journalctl accepts: `"2026-11-20 08:00"`, `08:00`, `today`, `yesterday`, `"1h ago"`.
+
+`jx ssh` reads only the SSH units (`ssh` on Debian and Ubuntu, `sshd` elsewhere, the per-connection units, and systemd's `sshd-vsock@` and the like). Their unit is recorded by journald itself, so other programs can't add lines to this view. A login is green only when the message starts with `Accepted`, so a user name like `Accepted publickey for root` can't pass for one. To look further back: `jx ssh --since "7 days ago"`.
 
 When `--grep` is combined with `-n` (for example `jx grep oom -n 20`), journalctl itself lists the matches newest first. Without `-n` they are in normal order.
 
@@ -112,7 +114,7 @@ When `--grep` is combined with `-n` (for example `jx grep oom -n 20`), journalct
 | `jx crash [N]` | How boot N ended (default `-1`): time range, whether it shut down cleanly, its last errors, its last lines, and coredumps from that boot |
 | `jx top [N]` | Which sources log the most in boot N, with error and warning counts. Useful before `vacuum`. |
 
-`crash` reports a clean shutdown when the boot reached `poweroff.target`, `reboot.target`, `halt.target`, `kexec.target` or `soft-reboot.target`. If none of them was reached, it says *no clean shutdown recorded: crash, freeze, power loss or hard reset*.
+`crash` reports a clean shutdown when the boot reached `poweroff.target`, `reboot.target`, `halt.target`, `kexec.target` or `soft-reboot.target`. If none of them was reached, it says *no clean shutdown recorded: crash, freeze, power loss or hard reset*. Only records of PID 1 running as root count (`_PID=1 _UID=0`, fields journald sets itself), so a program can't fake a clean shutdown by logging such a message. If journalctl or coredumpctl fail, their error is shown instead of a verdict.
 
 ```
 $ jx crash
@@ -160,7 +162,7 @@ $ jx top
 | `jx verify` | Check journal file consistency | `--verify` |
 | `jx rotate` | Rotate journal files now | `--rotate` |
 
-`vacuum` shows the current usage and asks for confirmation before deleting anything. The value decides the mode:
+`vacuum` shows the current usage and the exact command, and asks for confirmation before deleting anything. The value decides the mode:
 
 - **Size** (upper-case unit): `500M`, `2G`, `1.5G`, `500MB`
 - **Age** (spelled-out unit): `30min`, `12h`, `7d`, `2weeks`, `6months`, `1y`
@@ -172,7 +174,7 @@ Ambiguous values such as `500m` (megabytes or minutes?) or a bare `500` are reje
 | Command | Description |
 |---|---|
 | `jx json <unit> [n]` | Last n entries of a unit as pretty JSON (default 20) |
-| `jx export <file> [N]` | Write boot N to a text file with ISO timestamps and hostname; asks before overwriting, and leaves an existing file untouched if the export fails |
+| `jx export <file> [N]` | Write boot N to a text file with ISO timestamps and hostname; asks before overwriting, and leaves an existing file untouched if the export fails. The file is readable only by you (mode 600), as the journal can hold secrets such as passwords typed as user names; `chmod` it to share it |
 
 ### Other
 
@@ -201,7 +203,9 @@ In the column view a separator line appears whenever the day changes; when a new
 ```
 
 - The column view leaves out the hostname and PID; use `--raw` when you need them. Day names follow your locale (`LC_TIME`).
-- Terminal escape sequences in log messages (colors, window titles, cursor movement) are removed and other control characters are shown as `^X`, so a log entry cannot control your terminal.
+- Log entries are untrusted: any program can write them. Terminal escape sequences (colors, window titles, cursor movement) are removed, other control characters are shown as `^X`, and invisible or text-direction characters (`U+200B`, `U+202E`, …) as `<U+200B>`, so a log entry can neither control your terminal nor hide or reorder text. A newline in a source name is shown as `^J`. This also applies to `top`.
+- The source is the name a program gives itself (`SYSLOG_IDENTIFIER`), and any program can choose any name. Only `kernel` can be checked: a program posing as the kernel is shown as `kernel(its process name)`. To select by what journald records itself, use `jx unit`, `jx exe` or `jx pid`; `--raw -o verbose` shows all fields.
+- Messages are shown in full up to 64 KiB, longer ones are cut. jq may use at most 1 GiB of memory (it normally needs a few MB), so a gigantic entry stops the view with a message instead of filling the memory; `--raw` shows such an entry as blob data.
 - The column layout needs `jq`; without it jx uses `compact`.
 - If you pass your own output format (`-o json`, `-o verbose`, …) or `-x`, jx switches to raw output for that call.
 - Colors are used only when writing to a terminal and are disabled by [`NO_COLOR`](https://no-color.org).
@@ -245,21 +249,24 @@ jx --raw --no-pager err | grep -i usb
 | `--raw` / `--compact` | `JX_STYLE=columns\|compact\|raw` | Output style |
 | `--no-pager` | `JX_NOPAGER=1` | Disable the pager |
 | `-y`, `--yes` | | Don't ask for confirmation (`vacuum`, `export`) |
-| | `JX_PAGER` | Pager jx uses itself (column view, `failed`, `crash`); default `less -FRXMK` |
+| `--` | | Take everything after it as it is, e.g. `jx grep -- --yes` |
+| | `JX_PAGER` | Pager jx uses itself (column view, `failed`, `crash`); default `less -FRXMK`. Ignored when jx runs as root for another user |
 | | `JX_TOP` | Rows shown by `jx top`, a positive number (default 20) |
 | | `NO_COLOR` | Disable colors |
 
-Flags can go anywhere on the command line. When jx is not run from a terminal (scripts, cron), `vacuum` and overwriting with `export` can't ask and stop unless `--yes` is given.
+Flags can go anywhere on the command line before a `--`. When jx is not run from a terminal (scripts, cron), `vacuum` and overwriting with `export` can't ask and stop unless `--yes` is given.
 
 ## Permissions
 
-`jx` uses `sudo` for reading only when needed: when you are not root and not in `systemd-journal`, `adm` or `wheel`. To read logs without `sudo`, add yourself to the `systemd-journal` group and log in again:
+`jx` uses `sudo` for reading only when needed: when you are not root and the system journal isn't readable for you. jx checks the journal files themselves, because which groups may read them differs between distributions: `systemd-journal` everywhere, `adm` on Debian and Ubuntu, `wheel` on Fedora and Arch. If you can't read the journal and `sudo` isn't installed, jx warns that you see only your own messages. To read logs without `sudo`, add yourself to the `systemd-journal` group and log in again:
 
 ```bash
 sudo usermod -aG systemd-journal "$USER"
 ```
 
 `vacuum` and `rotate` change the journal and always run with `sudo`.
+
+**Don't allow jx in sudoers** (e.g. for "read-only" log access): it's an interactive tool with a pager and passes options through to journalctl. Give such users the `systemd-journal` group instead. When jx does run as root for another user (`sudo`, `doas`, `pkexec`, `su`), its pager runs in secure mode (no shell commands, pipes or saving to files) and `JX_PAGER` is ignored, as systemd does for its own pager.
 
 ## Persistent journal
 
@@ -273,9 +280,22 @@ sudo systemctl restart systemd-journald
 
 This works with the default `Storage=auto`. Alternatively set `Storage=persistent` in `/etc/systemd/journald.conf`.
 
-## Upgrading from the first version
+## Changes
 
-The first version of jx reported itself as `jx 1.0`; this release is numbered 0.2.
+### 0.3
+
+- **Pass-through options:** options that change the journal or write a file (`--vacuum-*`, `--rotate`, `--flush`, …) are refused by the reading commands; use `jx vacuum`, `jx rotate` or journalctl itself. `--` ends jx's own flags.
+- **`ssh`** covers the last 24 hours instead of today, includes the per-connection units, and shows logins in green, failures and probes in red.
+- **`crash`** counts only shutdown records of PID 1 running as root, so a clean shutdown can't be faked, and shows journalctl or coredumpctl errors instead of a verdict.
+- **Untrusted log entries:** invisible and text-direction characters are shown as `<U+XXXX>`, a program posing as the kernel as `kernel(its process name)`, and messages over 64 KiB are cut; jq may use at most 1 GiB of memory. This also applies to `top`.
+- **`export`** writes the file readable only by you (mode 600).
+- **`vacuum`** shows the exact command before asking.
+- **Permissions:** jx checks whether the journal files are readable instead of guessing from group names, and warns when it can show only your own messages. When run as root for another user, the pager runs in secure mode and `JX_PAGER` is ignored.
+- **Tests:** `tests/run.sh` runs jx against a fake journalctl, sudo and coredumpctl.
+
+### 0.2: upgrading from the first version
+
+The first version of jx reported itself as `jx 1.0`; 0.2 was the first release with the new numbering.
 
 - **Output:** the column view is the new default. Use `--raw` or `JX_STYLE=raw` for the old output.
 - **Language:** help and messages are in English.
@@ -291,10 +311,13 @@ The first version of jx reported itself as `jx 1.0`; this release is numbered 0.
 CI runs `shellcheck`, checks that both completion scripts parse, and runs a smoke test of the main commands (`.github/workflows/ci.yml`). Locally:
 
 ```bash
-shellcheck jx
+shellcheck jx tests/run.sh
 ./jx completion bash | bash -n
 ./jx completion zsh | zsh -n
+tests/run.sh
 ```
+
+`tests/run.sh` runs jx against a fake `journalctl`, `sudo` and `coredumpctl`, so it needs neither a journal nor root (only `jq` and `script`). The test for running as root for another user runs only where `sudo` works without a password, as in CI.
 
 ## License
 
