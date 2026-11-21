@@ -1,7 +1,5 @@
 # jx
 
-[![CI](https://github.com/Zittersplitter/jx/actions/workflows/ci.yml/badge.svg)](https://github.com/Zittersplitter/jx/actions/workflows/ci.yml)
-
 A small Bash wrapper around `journalctl` that turns the most common log queries into short, memorable subcommands and prints them in a readable column layout.
 
 ```bash
